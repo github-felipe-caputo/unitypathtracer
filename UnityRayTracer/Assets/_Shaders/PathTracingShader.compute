@@ -1,0 +1,439 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+static const float PI = 3.14159265f;
+static const int MAX_BOUNCES = 8;
+
+// Our result texture
+RWTexture2D<float4> Result;
+
+// Camera Values
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+// Pixel offset for aliasing 
+float2 _PixelOffset;
+
+// -------------------------------------------
+// Shader Random 
+// -------------------------------------------
+float2 _Pixel;
+float _Seed;
+
+float rand() {
+    float result = frac(sin(_Seed / 100.0f * dot(_Pixel, float2(12.9898f, 78.233f))) * 43758.5453f);
+    _Seed += 1.0f;
+    return result;
+}
+
+// -------------------------------------------
+// Skybox 
+// -------------------------------------------
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+
+// -------------------------------------------
+// Ray 
+// -------------------------------------------
+struct Ray {
+    float3 origin;
+    float3 direction;
+    float3 energy; // for bounces, some energy is lost
+};
+
+// Holds information about a ray intersection
+struct RayHit {
+    float3 position;
+    float distance;
+    float3 normal;
+
+    // These will hold the values of the object
+    float3 albedo;
+    float3 specular;
+    float smoothness;
+    float3 emission;
+};
+
+Ray CreateRay(float3 origin, float3 direction) {
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.energy = float3(1.0f, 1.0f, 1.0f);
+    return ray;
+}
+
+RayHit CreateRayHit() {
+    RayHit hit;
+    hit.position = float3(0.0f, 0.0f, 0.0f);
+    hit.distance = 1.#INF;
+    hit.normal = float3(0.0f, 0.0f, 0.0f);
+    hit.albedo = float3(0.0f, 0.0f, 0.0f);
+    hit.specular = float3(0.0f, 0.0f, 0.0f);
+    hit.smoothness = 0.0f;
+    hit.emission = float3(0.0f, 0.0f, 0.0f);
+    return hit;
+}
+
+// -------------------------------------------
+// Sphere 
+// -------------------------------------------
+struct Sphere {
+    float3 position;
+    float radius;
+
+    float3 albedo;
+    float3 specular;
+
+    float smoothness;
+    float3 emission;
+};
+StructuredBuffer<Sphere> _Spheres;
+uint _SpheresCount;
+
+void IntersectSphere(Ray ray, inout RayHit bestHit, Sphere sphere) {
+    // Calculate distance along the ray where the sphere is intersected
+    float3 d = ray.origin - sphere.position;
+    float p1 = -dot(ray.direction, d);
+    float p2sqr = p1 * p1 - dot(d, d) + sphere.radius * sphere.radius;
+    if (p2sqr < 0) {
+        return;
+    }
+    float p2 = sqrt(p2sqr);
+    float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+
+    // Check if there was an intersection AND if the distance is closer than
+    // the previous bestHit
+    if (t > 0 && t < bestHit.distance) {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - sphere.position);
+        bestHit.albedo = sphere.albedo;
+        bestHit.specular = sphere.specular;
+        bestHit.smoothness = sphere.smoothness;
+        bestHit.emission = sphere.emission;
+    }
+}
+
+float3x3 GetTangentSpace(float3 normal) {
+    // Choose a helper vector for the cross product
+    float3 helper = float3(1, 0, 0);
+    if (abs(normal.x) > 0.99f) {
+        helper = float3(0, 0, 1);
+    }
+
+    // Generate vectors
+    float3 tangent = normalize(cross(normal, helper));
+    float3 binormal = normalize(cross(normal, tangent));
+    return float3x3(tangent, binormal, normal);
+}
+
+// Cosine Weighted Sampling
+// https://blog.thomaspoulet.fr/uniform-sampling-on-unit-hemisphere/
+float3 SampleHemisphere(float3 normal, float m = 1) {
+    float cosTheta = pow(rand(), 1.0f / (1.0f + m));
+    float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
+    float phi = 2 * PI * rand();
+
+    // assumes normal is (0,0,1)
+    float3 tangentSpaceDir = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    // Transform direction to world space
+    return mul(tangentSpaceDir, GetTangentSpace(normal));
+}
+
+// -------------------------------------------
+// Triangle 
+// -------------------------------------------
+
+// The vertices should be in clockwise position
+struct Triangle {
+    // positions
+    float3 p1;
+    float3 p2;
+    float3 p3;
+
+    float3 albedo;
+    float3 specular;
+
+    float smoothness;
+    float3 emission;
+};
+StructuredBuffer<Triangle> _Triangles;
+uint _TrianglesCount;
+
+Triangle CreateTriangle(float3 p1, float3 p2, float3 p3) {
+    Triangle t;
+    t.p1 = p1;
+    t.p2 = p2;
+    t.p3 = p3;
+    t.albedo = float3(1.0f,0.0f,0.0f);
+    t.specular = float3(0.1f, 0.1f, 0.1f);
+    t.smoothness = 0.2f;
+    t.emission = float3(0.0f, 0.0f, 0.0f);
+    return t;
+}
+
+// https://fileadmin.cs.lth.se/cs/Personal/Tomas_Akenine-Moller/code/raytri_tam.pdf
+// https://en.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm
+void IntersectTriangle(Ray ray, inout RayHit bestHit, Triangle triang) {
+    float3 edge1 = triang.p2 - triang.p1;
+    float3 edge2 = triang.p3 - triang.p1;
+
+    float3 h = cross(ray.direction, edge2);
+    float a = dot(edge1, h);
+
+    // This check for face culling
+    if (a < 0)
+        return;
+
+    float f = 1.0f / a;
+    float3 s = ray.origin - triang.p1;
+    float u = f * dot(s,h);
+
+    if (u < 0.0f || u > 1.0f)
+        return;
+
+    float3 q = cross(s, edge1);
+    float v = f * dot(ray.direction, q);
+
+    if (v < 0.0f || u + v > 1.0f)
+        return;
+
+    float t = f * dot(edge2, q);
+    if (t > 0 && t < bestHit.distance) {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(cross(edge1, edge2));
+        bestHit.albedo = float3(0.98f,0.64f,0.54f);//triang.albedo;
+        bestHit.specular = 0.2f;//triang.specular;
+        bestHit.smoothness = 0.2f;//triang.smoothness;
+        bestHit.emission = float3(0.0f, 0.0f, 0.0f);//triang.emission;
+    }
+}
+
+
+// -------------------------------------------
+// Quads 
+// -------------------------------------------
+
+// the vertices should be in clockwise position, i.e.
+//     2-----3
+//     |     |
+//     1-----4
+
+struct Quad {
+    // Position of the Quad points
+    float3 p1;
+    float3 p2;
+    float3 p3;
+    float3 p4;
+    float3 normal;
+
+    // Values calculated for intersection
+    // equation = (x,y,z) = (a,b,c) on Ax + By + Cz + D = 0
+    float3 equation;
+    float dist;
+
+    float3 albedo;
+    float3 specular;
+
+    float smoothness;
+    float3 emission;
+};
+StructuredBuffer<Quad> _Quads;
+uint _QuadsCount;
+
+float3 planarCheckerTexture(Quad quad, float3 intersection) {
+    uint row, col;
+    float checksize = 0.05f;
+
+    // need to normalize intersection point between -1 and 1
+    float zn = (2.0f * (intersection.z - quad.p2.z) / (quad.p1.z - quad.p2.z)) - 1.0f;
+    float xn = (2.0f * (intersection.x - quad.p2.x) / (quad.p3.x - quad.p2.x)) - 1.0f;
+
+    float u = (zn + 1.0f) / 2.0f;
+    float v = (xn + 1.0f) / 2.0f;
+
+    // find row and col
+    uint total = 1/checksize;
+    for (int i = 0; i < (1/checksize); ++i) {
+        if (i*checksize < v && v < (i+1)*checksize) {
+            row = i;
+        }
+        if (i*checksize < u && u < (i+1)*checksize) {
+            col = i;
+        }
+    }
+
+    // check even or odds to know the color
+    if ((row % 2 && !(col % 2)) || !(row % 2) && col % 2) {
+        return float3(0.3f,0.3f,0.3f);
+    } else {
+        return float3(0.8f,0.8f,0.8f);
+    }
+}
+
+void IntersectQuad(Ray ray, inout RayHit bestHit, Quad quad) {
+    // face culling check first
+    if (dot(ray.direction, quad.normal) > 0)
+        return;
+
+    float t = -(dot(quad.equation, ray.origin) + quad.dist) / dot(quad.equation, ray.direction);
+
+    if (t > 0 && t < bestHit.distance) {
+        float3 position = ray.origin + t * ray.direction;
+
+        float3 v1 = quad.p2 - quad.p1;
+        float3 v3 = quad.p4 - quad.p3;
+        float3 v4 = position - quad.p1;
+        float3 v5 = position - quad.p3;
+
+        float3 v1_a = quad.p3 - quad.p2;
+        float3 v3_a = quad.p1 - quad.p4;
+        float3 v4_a = position - quad.p2;
+        float3 v5_a = position - quad.p4;
+
+        if (dot(v1,v4) >= 0 && dot(v3,v5) >= 0 && dot(v1_a,v4_a) >= 0 && dot(v3_a,v5_a) >= 0) {
+            bestHit.distance = t;
+            bestHit.position = position;
+            bestHit.normal = quad.normal;
+            bestHit.albedo = quad.albedo;//planarCheckerTexture(quad, position);
+            bestHit.specular = quad.specular;
+            bestHit.smoothness = quad.smoothness;
+            bestHit.emission = quad.emission;//0.0f;
+        }
+    }
+}
+
+// Ground plane is at y=0 with normal (0,1,0)
+void IntersectGroundPlane(Ray ray, inout RayHit bestHit) {
+    // Calculate distance along the ray where the ground plane is intersected
+    float t = -ray.origin.y / ray.direction.y;
+
+    if (t > 0 && t < bestHit.distance) {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = float3(0.0f, 1.0f, 0.0f);
+        bestHit.albedo = 0.8f;
+        bestHit.specular = 0.03f;
+        bestHit.smoothness = 0.2f;
+        bestHit.emission = 0.0f;
+    }
+}
+
+RayHit Trace(Ray ray){
+    RayHit bestHit = CreateRayHit();
+
+    //IntersectGroundPlane(ray, bestHit);
+
+    // Trace quads
+    for (uint i = 0; i < _QuadsCount; i++) {
+        IntersectQuad(ray, bestHit, _Quads[i]);
+    }
+
+    // Trace spheres
+    //for (uint j = 0; j < _SpheresCount; j++) {
+    //    IntersectSphere(ray, bestHit, _Spheres[j]);
+    //}
+
+    // Trace triangles
+    //for (uint y = 0; y < _TrianglesCount; y++) {
+    //    IntersectTriangle(ray, bestHit, _Triangles[y]);
+    //}
+
+    return bestHit;
+}
+
+float3 Shade(inout Ray ray, RayHit hit) {
+    if (hit.distance < 1.#INF) {
+
+        // offset for float point problems
+        ray.origin = hit.position + hit.normal * 0.001f; 
+
+        // albedo calculated always
+        hit.albedo = min(1.0f - hit.specular, hit.albedo);
+
+        // Calculate chances of diffuse and specular reflection
+        float specChance = dot(hit.specular, 1.0f / 3.0f);
+        float diffChance = dot(hit.albedo, 1.0f / 3.0f);
+        float sum = specChance + diffChance;
+        specChance /= sum;
+        diffChance /= sum;
+
+        // Ray will be reflected because of specular or diffuse component?
+        float roulette = rand();
+        if (roulette < specChance)
+        {
+            // Specular reflection
+            float alpha = pow(10000.0f, hit.smoothness * hit.smoothness);
+            float f = (alpha + 2) / (alpha + 1);
+
+            ray.direction = SampleHemisphere(reflect(ray.direction, hit.normal), alpha);
+            ray.energy *= (1.0f / specChance) * hit.specular * dot(hit.normal, ray.direction) * f;
+        }
+        else
+        {
+            // Diffuse reflection
+            ray.direction = SampleHemisphere(hit.normal, 1.0f);
+            ray.energy *= (1.0f / diffChance) * hit.albedo;
+        }
+
+        return hit.emission;
+    } else {
+
+        // Skybox shouldn't reflect anything;
+        ray.energy = 0.0f;
+
+        // Sample the skybox and write it
+        //float theta = 1.0f - acos(ray.direction.y) / PI;
+        //float phi = atan2(ray.direction.x, ray.direction.z) / (PI * 2.0f);
+        //return 2.0f * _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+        return 0.0f;
+    }
+}
+
+Ray CreateCameraRay(float2 uv) {
+    // Transforms point (0,0,0) from camera space to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    // this converts the screen coordinate uv to camera coordinates
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+
+    // Transform the direction from camera to world space and normalize
+    // now we need the direction that was on camera to world coordinates
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+
+    return CreateRay(origin, direction);
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID) {
+	// Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [-1,1] range
+    float u = 2.0f * (id.x + _PixelOffset.x) / width - 1.0f;
+    float v = 2.0f * (id.y + _PixelOffset.y) / height - 1.0f;
+
+    // Initialize our pixel global value
+    _Pixel = id.xy;
+
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(float2(u,v));
+
+    // Trace and shade
+    float3 result = 0.0f;
+    for (int i = 0; i < MAX_BOUNCES; i++) {
+        RayHit hit = Trace(ray);
+        result += ray.energy * Shade(ray, hit);
+
+        // No energy left, end
+        if(!any(ray.energy)) {
+            break;
+        }
+    }
+    Result[id.xy] = float4(result, 1);
+}
